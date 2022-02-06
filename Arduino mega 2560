@@ -1,0 +1,277 @@
+/*****************************************************************
+ Real-time energy Monitoring system for Industrial Machine.
+ Data to access through Blynk Legacy
+ Creation date:17Dec2021
+ Author:Divya Nacciar Kumaran
+ *******************************************************************/
+#define BLYNK_PRINT Serial
+
+#include <ModbusMaster.h>
+#include <ESP8266_Lib.h>
+#include <BlynkSimpleShieldEsp8266.h>
+
+#define SERIAL_OUTPUT 1
+
+#if SERIAL_OUTPUT
+#   define SERIAL_BEGIN(...) Serial.begin(__VA_ARGS__)
+#   define SERIAL_PRINT(...) Serial.print(__VA_ARGS__)
+#   define SERIAL_PRINTLN(...) Serial.println(__VA_ARGS__)
+#else
+#   define SERIAL_BEGIN(...)
+#   define SERIAL_PRINT(...)
+#   define SERIAL_PRINTLN(...)
+#endif
+
+#include "ModbusSensor.h"
+
+#define MB_SERIAL_PORT &Serial1   // Arduino has only one serial port, Mega has 3 serial ports.
+// if use Serial 0, remember disconect Tx (pin0) when upload sketch, then re-conect
+#define MB_BAUDRATE       2400          // b 2400
+#define MB_BYTEFORMAT     SERIAL_8N2    // Prty n
+#define TxEnablePin       17
+
+#define ID_1  1                       // id 001  modbus id of the energy monitor
+#define REFRESH_INTERVAL  5000        // refresh time, 5 SECONDS
+#define WRITE_INTERVAL 5000UL        // values send to serial port, 1 minute ( 60 * 1000)
+#define KWH_2_WS 36000000
+
+// Direcciones registros de datos solo lectura. Valores tipo float.
+// Utilizar funcion 04 lectura, numero de registros 16-bits 2.
+
+#define VOL_ADR 0x0000    // VOLTAGE.
+#define CUR_ADR 0x0006    // CURRENT.
+#define POW_ADR 0x000C    // ACTIVE POWER. 
+#define APO_ADR 0x0012    // Apparent power.
+#define PFA_ADR 0x001E    // Power factor.
+#define FRE_ADR 0x0046    // Frequency.
+#define PEN_ADR 0x0048    // IMPORTED ENERGY KWH
+#define REN_ADR 0x004A    // Export Energy.
+#define TEN_ADR 0x0156    // Energy activa Total.
+#define TRE_ADR 0x0158    // Total reactive energy.
+
+// multiplication factor, store value as an integer
+#define VOL_FAC 10
+#define CUR_FAC 100
+#define POW_FAC 10
+#define PFA_FAC 100
+#define FRE_FAC 10
+#define ENE_FAC 100
+
+char auth[] = "vwz3GfjRhAcgjGsaVLfviEE9qDRCRRP5";
+char ssid[] = "Kumaran";
+char pass[] = "0125256542";
+
+#define EspSerial Serial2
+#define ESP8266_BAUD 115200
+
+ESP8266 wifi(&EspSerial);
+BlynkTimer timer;
+WidgetTerminal terminal(V1);
+
+modbusMaster MBserial(MB_SERIAL_PORT, TxEnablePin);  // instance to collect data using Modbus protocol over RS485
+
+//variables to poll, process and send values
+modbusSensor volt(&MBserial, ID_1, VOL_ADR, CHANGE_TO_ZERO);
+modbusSensor curr(&MBserial, ID_1, CUR_ADR, CHANGE_TO_ZERO);
+modbusSensor pwr(&MBserial, ID_1, POW_ADR, CHANGE_TO_ZERO);
+modbusSensor enrg(&MBserial, ID_1, PEN_ADR, HOLD_VALUE);
+modbusSensor freq(&MBserial, ID_1, FRE_ADR, CHANGE_TO_ZERO);
+modbusSensor aPwr(&MBserial, ID_1, APO_ADR, CHANGE_TO_ZERO);
+modbusSensor pwrFact(&MBserial, ID_1, PFA_ADR, CHANGE_TO_ONE);
+
+uint16_t voltage, maxVoltage, minVoltage; // integer, factor x10
+uint16_t current, maxCurrent, minCurrent; // integer, factor x100
+uint16_t power, maxPower, minPower;       // integer, factor x10
+uint16_t lastEnergy, energy, avgPower;    // integer, factor x100
+uint16_t frequency, maxFreq, minFreq;     // integer, factor x100
+uint16_t aPower, maxApower, minApower;    // integer, factor x10
+uint16_t powerFactor, maxPF, minPF;       // integer, factor x100
+
+unsigned long previousMillis = 0;
+unsigned long currentMillis = 0;
+boolean       firstData;
+
+int notiState = 0;
+
+void myTimerEvent()
+{
+  // Blynk.virtualWrite(V5, millis() / 1000);
+
+  avgPower = (energy - lastEnergy) * KWH_2_WS / (WRITE_INTERVAL / 1000); //average power KWh/s to W
+  lastEnergy = energy;
+  firstData = true;
+
+  SERIAL_PRINT(millis() / 1000);
+  SERIAL_PRINT(",");
+  SERIAL_PRINT((float)maxVoltage / VOL_FAC, 1);
+  SERIAL_PRINT(",");
+  SERIAL_PRINT((float)minVoltage / VOL_FAC, 1);
+  SERIAL_PRINT(",");
+  SERIAL_PRINT((float)maxCurrent / CUR_FAC, 2);
+  SERIAL_PRINT(",");
+  SERIAL_PRINT((float)minCurrent / CUR_FAC, 2);
+  SERIAL_PRINT(",");
+  SERIAL_PRINT((float)maxPower / POW_FAC, 2);
+  SERIAL_PRINT(",");
+  SERIAL_PRINT((float)minPower / POW_FAC, 2);
+  SERIAL_PRINT(",");
+  SERIAL_PRINT((float)maxApower / POW_FAC, 2);
+  SERIAL_PRINT(",");
+  SERIAL_PRINT((float)minApower / POW_FAC, 2);
+  SERIAL_PRINT(",");
+  SERIAL_PRINT((float)maxFreq / FRE_FAC, 2);
+  SERIAL_PRINT(",");
+  SERIAL_PRINT((float)minFreq / FRE_FAC, 2);
+  SERIAL_PRINT(",");
+  SERIAL_PRINT((float)avgPower / ENE_FAC, 2);
+  SERIAL_PRINT(",");
+  SERIAL_PRINTLN((float)energy / ENE_FAC, 2);
+
+  unsigned long times = millis() / 1000.0; 
+  float MaxVolt = (float)maxVoltage / VOL_FAC;
+  float MinVolt = (float)minVoltage / VOL_FAC;
+  float MaxCurr = (float)maxCurrent / CUR_FAC;
+  float MinCurr = (float)minCurrent / CUR_FAC; 
+  float MaxPower = (float)maxPower / POW_FAC; 
+  float MinPower = (float)minPower / POW_FAC;
+  float MaxApPower = (float)maxApower / POW_FAC;
+  float MinApPower = (float)minApower / POW_FAC; 
+  float MaxFreq = (float)maxFreq / FRE_FAC; 
+  float MinFreq = (float)minFreq / FRE_FAC; 
+  float AvgPower = (float)avgPower / ENE_FAC; 
+  float Energy = (float)energy / ENE_FAC;
+
+  // send data to serial monitor
+  Serial.println("-----------------------------------------");
+  Serial.println("Times: " + String(times) + " s");
+  
+  Serial.println("MaxVolt: " + String(MaxVolt) + " V");
+  Serial.println("MinVolt: " + String(MinVolt) + " V");
+  
+  Serial.println("MaxCurr: " + String(MaxCurr) + " A");
+  Serial.println("MinCurr: " + String(MinCurr) + " A");
+  
+  Serial.println("MaxPower: " + String(MaxPower) + " W");
+  Serial.println("MinPower: " + String(MinPower) + " W");
+
+  Serial.println("MaxApPower: " + String(MaxApPower) + " VA");
+  Serial.println("MinApPower: " + String(MinApPower) + " VA");
+  
+  Serial.println("MaxFreq: " + String(MaxFreq) + " Hz");
+  Serial.println("MinFreq: " + String(MinFreq) + " Hz");
+
+  Serial.println("AvgPower: " + String(AvgPower) + " W");
+  Serial.println("Energy: " + String(Energy) + " kWh");
+  Serial.println("-----------------------------------------");
+
+  // send to chart blynk
+  Blynk.virtualWrite(V2,MaxPower); // power max
+  Blynk.virtualWrite(V3,MinPower); // power min
+  Blynk.virtualWrite(V4,Energy); // energy
+  
+  // send to blynk terminal  
+  terminal.clear();
+  terminal.println("Times: " + String(times) + " s");
+  
+  terminal.println("MaxVolt: " + String(MaxVolt) + " V");
+  terminal.println("MinVolt: " + String(MinVolt) + " V");
+  
+  terminal.println("MaxCurr: " + String(MaxCurr) + " A");
+  terminal.println("MinCurr: " + String(MinCurr) + " A");
+  
+  terminal.println("MaxPower: " + String(MaxPower) + " W");
+  terminal.println("MinPower: " + String(MinPower) + " W");
+
+  terminal.println("MaxApPower: " + String(MaxApPower) + " VA");
+  terminal.println("MinApPower: " + String(MinApPower) + " VA");
+  
+  terminal.println("MaxFreq: " + String(MaxFreq) + " Hz");
+  terminal.println("MinFreq: " + String(MinFreq) + " Hz");
+
+  terminal.println("AvgPower: " + String(AvgPower) + " W");
+  terminal.println("Energy: " + String(Energy) + " kWh");
+  terminal.flush();
+
+  // notification
+  float thresholdValue = 100; // in Watt(W)
+  float gap = 10;
+  if (MaxPower > thresholdValue && notiState == 0) {
+    notiState = 1;
+    Blynk.notify("alert power exceeded!!");
+  } else if (MaxPower < thresholdValue - gap) {
+    notiState = 0;
+  }
+}
+
+void setup() {
+  SERIAL_BEGIN(115200);
+  MBserial.begin(MB_BAUDRATE, MB_BYTEFORMAT, REFRESH_INTERVAL);
+  delay(95);
+  
+  SERIAL_PRINTLN("time(s), maxVolt(V), minVolt(V), maxCurr(A) minCurr(A), maxPower(W), minPower(W), maxApPower(VA), minApPower(VA), maxFreq(Hz), minFreq(Hz), AvgPower (W), Energy(Kwh)");
+
+  firstData = false;
+  power = 0;
+  maxPower = 0;    // in case it has been recorded, use it
+  minPower = 0;
+  lastEnergy = 0;  // in case it has been recorded, use it
+  energy = lastEnergy;
+
+  // Set ESP8266 baud rate
+  EspSerial.begin(ESP8266_BAUD);
+  delay(10);
+
+  Blynk.begin(auth, wifi, ssid, pass);
+  timer.setInterval(WRITE_INTERVAL, myTimerEvent); // every 5 second
+
+  terminal.clear();
+  terminal.flush();
+}
+
+void loop() {
+  Blynk.run();
+  timer.run(); // Initiates BlynkTimer
+  
+  sei();
+  if (MBserial.available()) {
+    voltage = volt.read(VOL_FAC);
+    current = curr.read(CUR_FAC);
+    power = pwr.read(POW_FAC);
+    aPower = aPwr.read(POW_FAC);
+    frequency = freq.read(FRE_FAC);
+    energy = enrg.read(ENE_FAC);
+
+    if (!firstData) {
+      if (maxVoltage < voltage) maxVoltage = voltage;
+      if (minVoltage > voltage) minVoltage = voltage;
+      if (maxCurrent < current) maxCurrent = current;
+      if (minCurrent > current) minCurrent = current;
+      if (maxPower < power) maxPower = power;
+      if (minPower > power) minPower = power;
+      if (maxApower < aPower) maxApower = aPower;
+      if (minApower > aPower) minApower = aPower;
+      if (maxFreq < frequency) maxFreq = frequency;
+      if (minFreq > frequency) minFreq = frequency;
+      if (maxPower < power) maxPower = power;
+      if (minPower > power) minPower = power;
+    }
+    else {
+      maxVoltage = voltage;
+      minVoltage = voltage;
+      maxCurrent = current;
+      minCurrent = current;
+      maxPower = power;
+      minPower = power;
+      maxApower = aPower;
+      minApower = aPower;
+      maxFreq = frequency;
+      minFreq = frequency;
+      firstData = false;
+    }
+  }
+
+//  currentMillis = millis();
+//  if (currentMillis - previousMillis >= WRITE_INTERVAL) {
+//    previousMillis = currentMillis;
+//  }
+}
